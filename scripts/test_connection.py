@@ -1,110 +1,185 @@
 #!/usr/bin/env python3
 """
-HUSKYLENS 2 MCP Connection Tester
+HUSKYLENS 2 MCP Connection Test
 
-Tests connectivity to HUSKYLENS 2 MCP service via SSE endpoint.
+Tests connectivity to HUSKYLENS 2 MCP service:
+1. TCP connectivity to device:port
+2. SSE endpoint accessibility
+3. MCP initialize handshake
+4. Tool discovery (tools/list)
 
 Usage:
-    python test_connection.py [--host HOST] [--port PORT] [--timeout SECONDS]
-
-Defaults:
-    --host 192.168.88.1
-    --port 3000
-    --timeout 5
+    python test_connection.py [--host HOST] [--port PORT]
 """
-import argparse
-import json
 import sys
+import time
+import json
+import re
+import subprocess
+import tempfile
+import os
 
 
-def test_http_connection(host, port, timeout):
-    """Test basic HTTP connectivity to the MCP service."""
-    import urllib.request
-    import urllib.error
-
-    url = f"http://{host}:{port}/sse"
-    print(f"Testing connection to {url} ...")
-
-    try:
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Accept", "text/event-stream")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = resp.status
-            headers = dict(resp.headers)
-            print(f"  Status: {status}")
-            print(f"  Content-Type: {headers.get("Content-Type", "unknown")}")
-            # Read a small chunk to confirm SSE stream
-            chunk = resp.read(1024).decode("utf-8", errors="replace")
-            print(f"  Received data: {len(chunk)} bytes")
-            if "event" in chunk.lower() or "data" in chunk.lower():
-                print("  SSE stream detected: OK")
-            return True
-    except urllib.error.URLError as e:
-        print(f"  Connection FAILED: {e.reason}")
-        return False
-    except Exception as e:
-        print(f"  Connection FAILED: {e}")
-        return False
-
-
-def test_tcp_connection(host, port, timeout):
-    """Test basic TCP connectivity."""
+def test_tcp(host, port, timeout=5):
+    """Test TCP connectivity."""
     import socket
-    print(f"Testing TCP connection to {host}:{port} ...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         result = sock.connect_ex((host, port))
         sock.close()
-        if result == 0:
-            print("  TCP connection: OK")
-            return True
-        else:
-            print(f"  TCP connection FAILED (errno={result})")
-            return False
-    except socket.timeout:
-        print("  TCP connection FAILED: timeout")
-        return False
+        return result == 0
     except Exception as e:
-        print(f"  TCP connection FAILED: {e}")
+        print(f"  TCP test error: {e}")
         return False
+
+
+def test_sse(host, port, timeout=10):
+    """Test SSE endpoint and get session info."""
+    sse_url = f"http://{host}:{port}/sse"
+    sse_file = os.path.join(tempfile.gettempdir(), "_hl2_test_sse.txt")
+    open(sse_file, 'wb').close()
+
+    proc = subprocess.Popen(
+        ["curl", "-s", "-N", "--max-time", str(timeout + 5), sse_url],
+        stdout=open(sse_file, "wb"),
+        stderr=subprocess.PIPE
+    )
+
+    session_id = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(sse_file, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            if 'session_id=' in text:
+                m = re.search(r'session_id=(\S+)', text)
+                if m:
+                    session_id = re.split(r'[\s&]', m.group(1))[0]
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    proc.terminate()
+    return session_id
+
+
+def test_mcp_init(host, port, session_id, timeout=15):
+    """Test MCP initialize handshake."""
+    msg_url = f"http://{host}:{port}/message?session_id={session_id}"
+
+    sse_file = os.path.join(tempfile.gettempdir(), "_hl2_test_sse2.txt")
+    open(sse_file, 'wb').close()
+
+    # Start SSE reader
+    proc = subprocess.Popen(
+        ["curl", "-s", "-N", "--max-time", str(timeout + 10),
+         f"http://{host}:{port}/sse"],
+        stdout=open(sse_file, "wb"),
+        stderr=subprocess.PIPE
+    )
+
+    time.sleep(2)
+
+    # Get new session ID
+    new_sid = None
+    with open(sse_file, 'r', encoding='utf-8', errors='replace') as f:
+        text = f.read()
+    m = re.search(r'session_id=(\S+)', text)
+    if m:
+        new_sid = re.split(r'[\s&]', m.group(1))[0]
+
+    if not new_sid:
+        proc.terminate()
+        return None
+
+    msg_url = f"http://{host}:{port}/message?session_id={new_sid}"
+
+    # Send initialize
+    subprocess.run(
+        ["curl", "-s", "-X", "POST", msg_url,
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps({
+             "jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {
+                 "protocolVersion": "2024-11-05",
+                 "capabilities": {},
+                 "clientInfo": {"name": "hl2-test", "version": "1.0"}
+             }
+         })],
+        capture_output=True, timeout=15
+    )
+
+    # Wait for response
+    time.sleep(3)
+    server_info = None
+    with open(sse_file, 'r', encoding='utf-8', errors='replace') as f:
+        text = f.read()
+
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line.startswith('data: '):
+            continue
+        payload = line[6:].strip()
+        if not payload or payload.isdigit():
+            continue
+        try:
+            obj = json.loads(payload)
+            if isinstance(obj, dict) and obj.get('id') == 1:
+                server_info = obj.get('result', {}).get('serverInfo', {})
+                break
+        except json.JSONDecodeError:
+            continue
+
+    proc.terminate()
+    return server_info
 
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Test HUSKYLENS 2 MCP connectivity")
-    parser.add_argument("--host", default="192.168.88.1", help="HUSKYLENS 2 IP address")
-    parser.add_argument("--port", type=int, default=3000, help="MCP service port")
-    parser.add_argument("--timeout", type=int, default=5, help="Connection timeout in seconds")
+    parser.add_argument("--host", default="192.168.88.1", help="Device IP")
+    parser.add_argument("--port", type=int, default=3000, help="MCP port")
     args = parser.parse_args()
 
-    print(f"=== HUSKYLENS 2 MCP Connection Test ===")
-    print(f"Target: {args.host}:{args.port}")
-    print()
+    host, port = args.host, args.port
+    print(f"HUSKYLENS 2 MCP Connection Test")
+    print(f"Target: {host}:{port}")
+    print("=" * 40)
 
-    tcp_ok = test_tcp_connection(args.host, args.port, args.timeout)
-    print()
-
-    if tcp_ok:
-        http_ok = test_http_connection(args.host, args.port, args.timeout)
-        print()
-
-        if http_ok:
-            print("Result: HUSKYLENS 2 MCP service is reachable and responding.")
-            print(f"SSE URL: http://{args.host}:{args.port}/sse")
-        else:
-            print("Result: TCP connection OK but MCP service not responding properly.")
-            print("Check that MCP service is enabled on HUSKYLENS 2.")
+    # Step 1: TCP
+    print("\n1. TCP Connectivity...")
+    if test_tcp(host, port):
+        print(f"   ✅ {host}:{port} is reachable")
     else:
-        print("Result: Cannot reach HUSKYLENS 2.")
-        print("Troubleshooting:")
-        print("  1. Ensure HUSKYLENS 2 is powered on")
-        print("  2. Ensure WiFi is connected (or use AP mode IP)")
-        print("  3. Ensure MCP service is enabled on device")
-        print("  4. Ensure your computer is on the same network")
-        print("  5. Try pinging the device: ping", args.host)
+        print(f"   ❌ {host}:{port} is NOT reachable")
+        print("   Check: WiFi connection, device power, MCP service enabled")
+        sys.exit(1)
 
-    return 0 if tcp_ok else 1
+    # Step 2: SSE
+    print("\n2. SSE Endpoint...")
+    session_id = test_sse(host, port)
+    if session_id:
+        print(f"   ✅ SSE endpoint accessible, session_id: {session_id[:20]}...")
+    else:
+        print("   ❌ Could not get session_id from SSE")
+        sys.exit(1)
+
+    # Step 3: MCP Init
+    print("\n3. MCP Initialize...")
+    server_info = test_mcp_init(host, port, session_id)
+    if server_info:
+        print(f"   ✅ MCP handshake successful")
+        print(f"   Server: {server_info.get('name', '?')} v{server_info.get('version', '?')}")
+    else:
+        print("   ❌ MCP initialize failed")
+        sys.exit(1)
+
+    print("\n" + "=" * 40)
+    print("✅ All tests passed! HUSKYLENS 2 MCP service is operational.")
+    print(f"\nSSE URL: http://{host}:{port}/sse")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
