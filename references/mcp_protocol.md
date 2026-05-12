@@ -2,106 +2,228 @@
 
 ## SSE连接
 
-HUSKYLENS 2 MCP服务通过SSE (Server-Sent Events) 协议通信。
+HUSKYLENS 2 MCP服务通过SSE (Server-Sent Events) + JSON-RPC 2.0协议通信。
 
-**端点格式：** `http://<device-ip>:3000/sse`
+**SSE端点：** `http://<device-ip>:3000/sse`
+**消息端点：** `http://<device-ip>:3000/message?session_id=<session-id>`
 
 **连接流程：**
-1. 客户端向SSE端点发起HTTP GET请求
-2. 服务端返回SSE事件流
-3. 客户端解析事件流获取工具列表和调用结果
+1. `GET /sse` → 获取 `endpoint` 事件（含 `session_id`）
+2. `POST /message?session_id=xxx` → 发送 JSON-RPC 请求
+3. 响应通过 SSE 事件流返回（事件类型：`message`）
 
-## 工具详细说明
+**关键限制：** SSE连接是临时的。连接断开后session立即失效，每次交互需重新建立SSE连接并保持长连接读取响应。
 
-### manage_applications
+## MCP协议交互序列（必须按顺序执行）
 
-管理HUSKYLENS 2的AI算法/模型。
+```
+Client                          Server
+  |--- GET /sse ----------------->|
+  |<-- event:endpoint ------------|
+  |<-- event:heartbeat (0,1,2...)|
+  |                               |
+  |--- POST /message (initialize) ->|
+  |<-- event:message (id=1, result: serverInfo) --|
+  |                               |
+  |--- POST /message (initialized notif) ->|
+  |                               |
+  |--- POST /message (tools/list) -->|
+  |<-- event:message (id=2, result: tools[]) --|
+  |                               |
+  |--- POST /message (tools/call) -->|
+  |<-- event:message (id=N, result: content[]) --|
+```
 
-**功能：**
-- 列出所有可用的AI算法
-- 切换当前运行的算法
-- 查询当前运行的算法名称
+**注意：** 每条POST的响应不立即返回，需通过SSE流接收。所有请求必须在此SSE连接内完成。
 
-**支持的算法（25种）：**
+## 初始化参数
 
-| 序号 | 算法名称 | 功能说明 |
-|-----|---------|---------|
-| 1 | 人脸检测 | 检测画面中的人脸位置 |
-| 2 | 人脸识别 | 检测并识别已学习的人脸 |
-| 3 | 人脸五官检测 | 检测人脸五官关键点 |
-| 4 | 物体识别 | 识别80种COCO类别物体 |
-| 5 | 物体追踪 | 追踪指定物体运动 |
-| 6 | 颜色识别 | 识别和区分颜色 |
-| 7 | 物体分类 | 图像分类 |
-| 8 | 自学习分类 | 用户自定义分类训练 |
-| 9 | 实例分割 | 像素级目标分割 |
-| 10 | 手掌检测 | 检测手掌位置 |
-| 11 | 手掌关键点检测 | 检测手掌21个关键点 |
-| 12 | 手势识别 | 识别手势动作 |
-| 13 | 人体检测 | 检测人体位置 |
-| 14 | 人体关键点检测 | 检测人体骨骼关键点 |
-| 15 | 姿态识别 | 识别人体姿态 |
-| 16 | 车牌识别 | 识别车牌号码 |
-| 17 | 文字识别 | OCR文字识别 |
-| 18 | 巡线追踪 | 巡线导航 |
-| 19 | 表情识别 | 识别面部表情 |
-| 20 | 注视方向检测 | 检测眼睛注视方向 |
-| 21 | 人脸朝向检测 | 检测人脸朝向 |
-| 22 | 标签识别 | 识别AprilTag等标签 |
-| 23 | 二维码识别 | 识别QR码 |
-| 24 | 条形码识别 | 识别条形码 |
-| 25 | 跌倒检测 | 检测人体跌倒 |
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": "hl2-client", "version": "1.0"}
+  }
+}
+```
 
-**模糊匹配说明：** 算法切换支持模糊识别，例如指令"人脸检测"会自动匹配到"人脸识别"。
+**服务器响应：**
+```json
+{
+  "result": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {"tools": {}},
+    "serverInfo": {"name": "Huskylens MCP Server", "version": "1.0.1"}
+  }
+}
+```
 
-### multimedia_control
+## 工具详细说明（10个，已验证）
 
-控制HUSKYLENS 2的多媒体功能。
+### 1. manage_applications
+**operation值：** `application_list` | `current_application` | `switch_application`
+**algorithm参数：** 仅 `switch_application` 时必需（算法英文名）
 
-**功能：**
-- 拍照：拍摄当前摄像头画面，照片保存到U盘系统
+返回示例（application_list）：
+```json
+{
+  "algorithms": [
+    {"id": 1, "name_en": "Face Recognition", "name_cn": "人脸识别"},
+    {"id": 2, "name_en": "Object Recognition", "name_cn": "物体识别"},
+    ...
+  ]
+}
+```
 
-### get_recognition_result
+### 2. multimedia_control
+**operation值：** `take_photo` | `take_screenshot` | `play_music` | `start_recording_audio` | `stop_recording_audio`
+**resolution：** `1920x1080` | `1280x720` | `640x480`，仅take_photo有效
 
-获取当前算法的识别结果。
+**返回示例（take_photo）：**
+```json
+{"cmd": "take_photo", "filename": "20260512_162011_1920x1080.jpg", "ret": "success"}
+```
 
-**返回信息：**
-- 检测到的目标列表
-- 每个目标的ID、名称、置信度
-- 目标在画面中的位置坐标（中心点x,y和宽高w,h）
+照片不会内嵌在响应中。下载方式：`http://<device-ip>/photo/`
 
-### task_scheduler
+### 3. get_recognition_result
+**operation值：** `get_result`
+**algorithm值：** 当前运行算法ID（数字，需先用current_application查询）
 
-设置条件触发的自动任务。
+返回：
+```json
+{
+  "content": [
+    {"type": "resource_link", "mimeType": "image/jpeg", "uri": "http://192.168.88.1/photo/result.jpg"},
+    {"type": "text", "text": "[{\"id\":1,\"name\":\"keyboard\",\"x\":320,\"y\":240,\"w\":100,\"h\":80}]"}
+  ]
+}
+```
 
-**功能：**
-- 当指定目标出现在画面时执行操作（如拍照）
-- 触发机制：目标出现后执行一次，目标消失后重新出现才会再次执行
-- 拍摄的照片存储在U盘系统的photo文件夹中
+### 4. task_scheduler
+**operation值：** 任务操作
+**tasks参数：** 任务数组
+
+### 5. learn_control
+**operation值：** `learn` | `learn_block` | `forget` | `set_name_by_id`
+**参数规则：** `learn`仅需algorithm；`learn_block`需algorithm+x+y+width+height；`set_name_by_id`需algorithm+id+name
+**返回值：** id为0表示学习失败
+
+### 6. knowledges_control
+**operation值：** `save_knowledges` | `load_knowledges`
+需algorithm+knowledges_id
+
+### 7. algorithm_params_control
+**operation值：** `get_algorithm_params` | `set_algorithm_params`
+`set_algorithm_params`时params为JSON字符串数组：`[{"rec_thres": 0.2}]`
+
+### 8. device_control
+**operation值：** `set_backlight` | `get_backlight` | `set_system_volume` | `get_system_volume` | `set_flashlight` | `get_flashlight`
+- backlight/volume/flashlight范围：0-100，volume仅支持步进10
+
+### 9. draw_control
+**operation值：** `draw_text` | `draw_rect` | `draw_unique_rect` | `clear_text` | `clear_rect`
+- draw_text：`text, color, x, y, font_size`（font_size仅支持20/24/26/27/28/32/36/40/48）
+- draw_rect/draw_unique_rect：`color, x, y, width, height, line_width`
+- color格式：`#RRGGBB` 或 `#RRGGBBAA`（十六进制RGBA）
+
+### 10. multi_algorithm_control
+**operation值：** 多算法配置
+**algorithms/ratios：** 算法ID数组和屏幕比例
 
 ## 终端调试
 
-SSH连接HUSKYLENS 2：
+SSH连接：
 ```
 ssh root@192.168.88.1
 ```
 
-**配置文件：**
-- `llm_agent.json` — 大模型API配置（api_key等）
-- `huskylens_mcp_server.json` — MCP服务工具描述和提示词
+配置文件：
+- `/mnt/udisk0/llm_agent.json` — 大模型API配置
+- `/mnt/udisk0/huskylens_mcp_server.json` — MCP服务工具描述
 
-**手动启动MCP服务：**
+启动MCP服务：
 ```bash
 /opt/huskylens_mcp_server
 ```
 
-**检查MCP服务状态：**
+检查运行状态：
 ```bash
 ps -ef | grep mcp
 ```
 
-**运行内部智能体：**
-```bash
-./llm_agent
+## Python客户端实现参考
+
+```python
+import subprocess, json, re, time, base64, threading
+
+def mcp_call(host, port, tool_name, args, timeout=30):
+    """Execute a single MCP tool call."""
+    sse_file = "_sse.txt"
+    open(sse_file, 'wb').close()
+    sse_proc = subprocess.Popen(
+        ["curl.exe", "-s", "-N", "--max-time", f"{timeout+10}", f"http://{host}:{port}/sse"],
+        stdout=open(sse_file, "wb"), stderr=subprocess.PIPE
+    )
+    time.sleep(2)
+    with open(sse_file, 'r', encoding='utf-8', errors='replace') as f:
+        text = f.read()
+    m = re.search(r'session_id=(\S+)', text)
+    if not m: return None
+    sid = re.split(r'[\s&]', m.group(1))[0]
+    msg_url = f"http://{host}:{port}/message?session_id={sid}"
+    
+    id_ctr = [0]
+    def find_resp(tid, to):
+        deadline = time.time() + to
+        while time.time() < deadline:
+            with open(sse_file, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            for line in text.split('\n'):
+                line = line.strip()
+                if not line.startswith('data: ') or len(line) <= 8: continue
+                payload = line[6:].strip()
+                if not payload or payload.isdigit(): continue
+                depth = 0
+                for i, ch in enumerate(payload):
+                    if ch == '{': depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(payload[:i+1])
+                                if isinstance(obj, dict) and obj.get('id') == tid:
+                                    return obj
+                            except: pass
+                            break
+            time.sleep(0.5)
+        return None
+    
+    # Initialize
+    id_ctr[0] = 1
+    subprocess.run(["curl.exe", "-s", "-X", "POST", msg_url,
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize",
+          "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hl2","version":"1.0"}}})],
+        capture_output=True, timeout=15)
+    time.sleep(1)
+    subprocess.run(["curl.exe", "-s", "-X", "POST", msg_url,
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"})],
+        capture_output=True, timeout=15)
+    time.sleep(0.5)
+    
+    # Call tool
+    tid = 10
+    subprocess.run(["curl.exe", "-s", "-X", "POST", msg_url,
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps({"jsonrpc":"2.0","id":tid,"method":"tools/call",
+          "params":{"name":tool_name,"arguments":args}})],
+        capture_output=True, timeout=15)
+    
+    resp = find_resp(tid, timeout)
+    sse_proc.terminate()
+    return resp
 ```
-内部智能体可获取摄像头画面，对"你看到了什么"有更准确的回答。
